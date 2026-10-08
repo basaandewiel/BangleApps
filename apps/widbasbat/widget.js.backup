@@ -1,0 +1,84 @@
+WIDGETS["bat"] = {
+  area: "tr",
+  width: 40,
+  _lastBat: -1,
+  _lastChg: false,
+  interval: undefined,
+
+  draw() {
+    // 1. Teken alleen als het scherm AAN staat en coördinaten bekend zijn
+    if (!Bangle.isLCDOn() || this.x === undefined) return;
+
+    var battery = E.getBattery();
+    var charging = Bangle.isCharging();
+
+    // 2. Sla hertekenen over als batterij- % én laadstatus ongewijzigd zijn
+    if (battery === this._lastBat && charging === this._lastChg) return;
+    this._lastBat = battery;
+    this._lastChg = charging;
+
+    var x = this.x, y = this.y;
+
+    // 3. Teken de batterijbehuizing
+    g.reset("widget")
+     .setColor(g.theme.fg)
+     .fillRect(x, y + 2, x + 35, y + 21)
+     .clearRect(x + 2, y + 4, x + 33, y + 19)
+     .fillRect(x + 36, y + 10, x + 39, y + 14);
+
+    // 4. Bepaal kleur en vulniveau
+    if (battery < 20) g.setBgColor("#f00");
+    else if (battery < 40) g.setBgColor(g.theme.dark ? "#ff0" : "#f80");
+    else g.setBgColor("#0f0");
+
+    g.clearRect(x + 4, y + 6, x + 4 + Math.round(battery * 0.27), y + 17);
+
+    // 5. Bliksemschicht bij laden
+    if (charging) {
+      g.reset("widget").drawImage(atob("FAqBAAHAAA8AAPwAB/D4f8P+Hw/gAD8AAPAAA4A="), x + 8, y + 7);
+    }
+  },
+
+  remove() {
+    Bangle.removeListener('charging', this.onCharging);
+    Bangle.removeListener('lcdPower', this.onPower);
+    if (this.interval) clearInterval(this.interval);
+    delete WIDGETS["bat"];
+  },
+
+  onCharging() {
+    if (WIDGETS["bat"]) {
+      WIDGETS["bat"]._lastChg = !Bangle.isCharging(); // Forceer redraw
+      WIDGETS["bat"].draw();
+    }
+  },
+
+  onPower(on) {
+    var w = WIDGETS["bat"];
+    if (!w) return;
+
+    if (on) {
+      // Scherm AAN: ververs direct en start de 1-minuut timer
+      w._lastBat = -1; // Forceer redraw bij scherm-wake
+      w.draw();
+      if (!w.interval) {
+        w.interval = setInterval(() => w.draw(), 60000);
+      }
+    } else {
+      // Scherm UIT: stop de timer om CPU/batterij te sparen
+      if (w.interval) {
+        clearInterval(w.interval);
+        w.interval = undefined;
+      }
+    }
+  }
+};
+
+// Event listeners inschakelen
+Bangle.on('charging', WIDGETS["bat"].onCharging);
+Bangle.on('lcdPower', WIDGETS["bat"].onPower);
+
+// Initiële timer instellen als het scherm nu al aan staat
+if (Bangle.isLCDOn()) {
+  WIDGETS["bat"].interval = setInterval(() => WIDGETS["bat"].draw(), 60000);
+}

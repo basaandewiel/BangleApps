@@ -1,0 +1,17 @@
+{
+  "id": "widbaspb",
+  "name": "Baswi Pedometer",
+  "shortName":"Baswi Pedometer",
+  "icon": "screenshot_widpb.png",
+  "screenshots": [{"url":"screenshot_widpb.png"}],
+  "version":"0.01",
+  "author": "Espruino",
+  "type": "widget",
+  "supports": ["BANGLEJS", "BANGLEJS2"],
+  "readme": "README.md",
+  "description": "Displays the current step count from `Bangle.getHealthStatus(\"day\").steps` in the Lato font",
+  "tags": "widget,battery",
+  "storage": [
+    {"name":"widbaspb.wid.js","url":"widbaspb.wid.js"}
+   ]
+ }
