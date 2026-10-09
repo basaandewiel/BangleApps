@@ -5,3 +5,6 @@
 0.05: Use weather condition code for icon selection.
 0.06: WeatherClock icons now reflect weather conditions better. Add settings menu to hide elements and to use weather icons of Weather app. Images placed into functions for performance.
 0.07: Add yellow to error icon to show up on dark theme.
+0.08: Battery optimization: only redraw the time each minute, read weather
+      once and update on the weather event, cache icon decompression, and add
+      cleanup for fast loading.
