@@ -18,10 +18,25 @@
  *      dezelfde regel als de datum. "Show date" is er, met een eigen
  *      aan/uit-knop.
  *
- *   4. Batterij-optimalisatie bij stilstand: als het horloge 10 minuten niet
- *      bewogen is (gemeten via Bangle 'step'), schakelt het horloge over naar
- *      een herteken-interval van 5 minuten. Zodra het horloge weer beweegt,
- *      ontwaakt de klok direct en hervat het 1-minuut interval.
+ *   4. Batterij-optimalisatie. Vier maatregelen:
+ *      a. Bij stilstand: als het horloge 10 minuten niet bewogen is (gemeten
+ *         via Bangle 'step'), schakelt het over naar een herteken-interval van
+ *         5 minuten. Zodra het horloge weer beweegt, ontwaakt de klok direct en
+ *         hervat het 1-minuut interval.
+ *      b. Deelupdates: normaal verandert alleen de tijd. In plaats van elke
+ *         minuut het hele appRect te wissen en opnieuw te tekenen, wissen we
+ *         alleen het vak van de tijd. Alleen bij middernacht (datum), een
+ *         weerupdate of te weinig ruimte tekenen we alles opnieuw. Dat scheelt
+ *         CPU-werk en, doordat de firmware alleen gewijzigde gebieden naar het
+ *         (memory-)LCD schrijft, ook beeldschermvermogen.
+ *      c. Weer op verzoek lezen: w.get() leest weather.json van flash en parset
+ *         JSON. Dat gebeurt nu bij het starten en daarna alleen nog als de
+ *         weather-module een 'update' stuurt (niet meer elke minuut). De
+ *         weericoon-decompressie (heatshrink) gebeurt daardoor ook niet meer
+ *         elke minuut.
+ *      d. Opruimen + fast loading: via de remove-handler van setUI stoppen we
+ *         de timers en listeners, zodat er na het verlaten van de klok niets
+ *         op de achtergrond blijft tekenen.
  *
  * RAM-GEBRUIK
  *   Gemeten op het echte horloge, steeds na een schone reboot met deze app
@@ -97,7 +112,6 @@ var w = require("weather");
 
 var SETTINGS_FILE = "weatherClock.json";
 var DEG = "\u00b0";   // graden-teken als escape, zie de kop hierboven
-var ICON_PAD = 8;    // had de Layout ook: 8 px padding rond het weericoon
 var ICON_SIZE = 50;  // de heatshrink-iconen zijn 50x50
 
 // Weericoontjes, gecomprimeerd met heatshrink.
@@ -238,6 +252,58 @@ var fontTemp = fontFromPct(s.wind ? 10 : 20);
 var fontWind = fontFromPct(10);
 var fontDate = fontFromPct(10);
 
+// ------------------------------------ weer: op verzoek, niet elke minuut
+// w.get() leest weather.json van flash en parset JSON. Dat elke minuut doen is
+// onnodig flash- en CPU-gebruik. Daarom lezen we bij het starten, bij een
+// 'update'-event van de weather-module en na het verlopen van de weerdata.
+var weather = w.get();
+var tempLabel, windLabel, iconImg;
+
+// De weather-module wist weather.json stil als de ingestelde bewaartijd
+// verstreken is, zonder 'update'-event. Om te weten wanneer we opnieuw moeten
+// lezen, onthouden we die bewaartijd (standaard 2 uur) en of we al gecheckt
+// hebben. Zo blijft het bij hooguit een handeling per verlopen periode.
+var EXPIRY_MS = (storage.readJSON("weatherSetting.json", 1) || {}).expiry;
+if (EXPIRY_MS === undefined) EXPIRY_MS = 2 * 3600000;
+var expiryChecked = false;
+
+function updateWeatherDisplay() {
+  var curr = weather;
+  if (curr) {
+    tempLabel = fmtTemp(curr.temp - 273.15);
+    windLabel = fmtSpeed(curr.wind) + " " + (curr.wrose || "").toUpperCase();
+    var code = curr.code || -1;
+    if (!s.icon) {
+      iconImg = getDummy();
+    } else if (s.src) {
+      iconImg = wDrawIcon(code > 0 ? curr.code : curr.txt);
+    } else if (code > 0) {
+      iconImg = chooseIconByCode(code)();
+    } else {
+      iconImg = chooseIcon(curr.txt)();
+    }
+  } else {
+    tempLabel = "Err";
+    windLabel = "No Data";
+    iconImg = s.icon ? getErr() : getDummy();
+  }
+}
+
+function onWeatherUpdate() {
+  // De payload van het 'update'-event is niet altijd het weerobject zelf
+  // (v1 en v2 sturen iets anders). Daarom opnieuw w.get(), net als de
+  // weather-app zelf doet.
+  weather = w.get();
+  expiryChecked = false;
+  updateWeatherDisplay();
+  drawAll(); // volledige hertekening + nieuw schema
+}
+w.on("update", onWeatherUpdate);
+
+// hoogte van de datumregel, nodig om bij een deelupdate niet in de datum te wissen
+g.setFont(fontDate);
+var DATE_H = g.getFontHeight();
+
 // ------------------------------------------------- inactiviteit & batterij
 var IDLE_TIMEOUT_MS = 10 * 60 * 1000; // 10 minuten stilstand
 var idleTimer;
@@ -246,7 +312,7 @@ var isIdle = false;
 function onIdle() {
   if (!isIdle) {
     isIdle = true;
-    draw(); // Teken opnieuw om direct het 5-minuten schema te starten
+    queueDraw(); // inhoud is al actueel; alleen het schema vertragen
   }
 }
 
@@ -254,20 +320,138 @@ function resetIdleTimer() {
   if (idleTimer) clearTimeout(idleTimer);
 
   if (isIdle) {
+    // eerste stap na een periode van stilstand: direct bijwerken + 1-min schema
     isIdle = false;
-    draw(); // Herteken direct en hervat het 1-minuut schema
-  } else {
-    idleTimer = setTimeout(onIdle, IDLE_TIMEOUT_MS);
+    tick();
   }
+  // opnieuw beginnen te tellen (ook direct na het ontwaken)
+  idleTimer = setTimeout(onIdle, IDLE_TIMEOUT_MS);
 }
 
-// Gebruik het hardware/step event van de firmware voor betrouwbare detectie
-Bangle.on('step', function() {
-  resetIdleTimer();
-});
+var lastStepTime = 0;
+function onStep() {
+  var now = Date.now();
+  // slechts eens per 10 seconden verwerken
+  if (now - lastStepTime > 10000) {
+    lastStepTime = now;
+    resetIdleTimer();
+  }
+}
+Bangle.on('step', onStep);
+
+// Op Bangle.js 1 stopt de timer als het scherm uit is (stroom besparen) en
+// hervat hij zodra het scherm weer aan gaat. Op Bangle.js 2 staat het scherm
+// altijd aan, dus dan gebeurt hier niets bijzonders.
+function onLcdPower(on) {
+  if (on) {
+    tick(); // direct actueel + schema hervatten
+  } else if (drawTimeout) {
+    clearTimeout(drawTimeout);
+    drawTimeout = undefined;
+  }
+}
+Bangle.on('lcdPower', onLcdPower);
 
 // ------------------------------------------------- tekenen / bijwerken
 var drawTimeout;
+var lastDateStr = null; // om middernacht te detecteren
+var lastTimeW = 0;      // breedte van de vorige tijd, i.v.m. wissen
+
+// Wis- en tekenvak voor alleen de tijd. Geeft null terug als het vak de
+// datumregel zou raken; dan valt de aanroeper terug op volledig hertekenen.
+function timeBox(R, tw) {
+  g.setFont(fontTime);
+  var fh = g.getFontHeight();
+  var cx = R.x + R.w * PUNTEN.tijdX;
+  var cy = R.y + R.h * PUNTEN.tijdY;
+  var half = Math.ceil((fh + 4) / 2);
+  var top = cy - half, bot = cy + half;
+  if (s.date) {
+    var dateTop = R.y + R.h * PUNTEN.datumY - DATE_H / 2 - 1;
+    if (bot > dateTop) bot = dateTop;
+  }
+  if (bot <= top) return null;
+  var w = Math.max(tw, lastTimeW) + 4;
+  return {
+    x1: Math.round(cx - w / 2), y1: Math.round(top),
+    x2: Math.round(cx + w / 2), y2: Math.round(bot)
+  };
+}
+
+function drawTime() {
+  var R = Bangle.appRect;
+  var str = fmtTime(new Date());
+  g.setFont(fontTime);
+  var tw = g.stringWidth(str);
+  var b = timeBox(R, tw);
+  if (!b) return false;
+  g.reset();
+  g.clearRect(b.x1, b.y1, b.x2, b.y2);
+  g.setFont(fontTime);
+  g.setFontAlign(0, 0);
+  g.drawString(str, R.x + R.w * PUNTEN.tijdX, R.y + R.h * PUNTEN.tijdY);
+  lastTimeW = tw;
+  return true;
+}
+
+function drawAll() {
+  var R = Bangle.appRect;
+  var date = new Date();
+
+  g.reset();
+  g.clearRect(R.x, R.y, R.x + R.w - 1, R.y + R.h - 1);
+
+  lastTimeW = 0;
+  lastDateStr = s.date ? fmtDate(date) : null;
+  drawTime();
+
+  // datum
+  if (s.date) {
+    g.setFont(fontDate);
+    g.setFontAlign(0, 0);
+    g.drawString(lastDateStr, R.x + R.w * PUNTEN.datumX,
+                 R.y + R.h * PUNTEN.datumY);
+  }
+
+  // weericoon
+  g.drawImage(iconImg, R.x + R.w * PUNTEN.icoonX - ICON_SIZE / 2,
+              R.y + R.h * PUNTEN.icoonY - ICON_SIZE / 2);
+
+  // temperatuur & wind
+  g.setFont(fontTemp);
+  g.setFontAlign(0, 0);
+  g.drawString(tempLabel, R.x + R.w * PUNTEN.tempX,
+               R.y + R.h * (s.wind ? PUNTEN.tempY : PUNTEN.icoonY));
+  if (s.wind) {
+    g.setFont(fontWind);
+    g.drawString(windLabel, R.x + R.w * PUNTEN.windX,
+                 R.y + R.h * PUNTEN.windY);
+  }
+
+  queueDraw();
+}
+
+// Een tik van de klok: meestal is alleen de tijd gewijzigd. Alleen bij
+// middernacht (datum) of als er geen ruimte is voor een deelupdate tekenen we
+// alles opnieuw.
+function tick() {
+  var now = Date.now();
+  // Weer verlopen? De weather-module heeft weather.json dan stil gewist. Lees
+  // eenmalig opnieuw (hooguit een keer per verlopen periode, niet per minuut).
+  if (!expiryChecked && weather && weather.time && now - weather.time > EXPIRY_MS) {
+    expiryChecked = true;
+    weather = w.get();
+    updateWeatherDisplay();
+    drawAll();
+    return;
+  }
+  var date = new Date();
+  if ((s.date && fmtDate(date) !== lastDateStr) || !drawTime()) {
+    drawAll();
+  } else {
+    queueDraw();
+  }
+}
 
 function queueDraw() {
   if (drawTimeout) clearTimeout(drawTimeout);
@@ -287,75 +471,27 @@ function queueDraw() {
 
   drawTimeout = setTimeout(function () {
     drawTimeout = undefined;
-    draw();
+    tick();
   }, intervalMs);
-}
-
-function draw() {
-  var R = Bangle.appRect;
-  var date = new Date();
-  var curr = w.get();
-  var tempLabel, windLabel, icon;
-
-  if (curr) {
-    tempLabel = fmtTemp(curr.temp - 273.15);
-    windLabel = fmtSpeed(curr.wind) + " " + (curr.wrose || "").toUpperCase();
-    var code = curr.code || -1;
-    if (s.src) {
-      icon = wDrawIcon(code > 0 ? curr.code : curr.txt);
-    } else if (code > 0) {
-      icon = chooseIconByCode(curr.code);
-    } else {
-      icon = chooseIcon(curr.txt);
-    }
-    if (!s.icon) icon = getDummy;
-  } else {
-    tempLabel = "Err";
-    windLabel = "No Data";
-    icon = s.icon ? getErr : getDummy;
-  }
-
-  if (typeof icon === "function") icon = icon();
-
-  g.reset();
-  g.clearRect(R.x, R.y, R.x + R.w - 1, R.y + R.h - 1);
-
-  // tijd
-  g.setFont(fontTime);
-  g.setFontAlign(0, 0);
-  g.drawString(fmtTime(date), R.x + R.w * PUNTEN.tijdX,
-               R.y + R.h * PUNTEN.tijdY);
-
-  // datum
-  if (s.date) {
-    g.setFont(fontDate);
-    g.drawString(fmtDate(date), R.x + R.w * PUNTEN.datumX,
-                 R.y + R.h * PUNTEN.datumY);
-  }
-
-  // weericoon
-  g.drawImage(icon, R.x + R.w * PUNTEN.icoonX - ICON_SIZE / 2,
-              R.y + R.h * PUNTEN.icoonY - ICON_SIZE / 2);
-
-  // temperatuur & wind
-  g.setFont(fontTemp);
-  g.drawString(tempLabel, R.x + R.w * PUNTEN.tempX,
-               R.y + R.h * (s.wind ? PUNTEN.tempY : PUNTEN.icoonY));
-  if (s.wind) {
-    g.setFont(fontWind);
-    g.drawString(windLabel, R.x + R.w * PUNTEN.windX,
-                 R.y + R.h * PUNTEN.windY);
-  }
-
-  queueDraw();
 }
 
 // ------------------------------------------------------------------ start
 g.clear();
-Bangle.setUI("clock");
+Bangle.setUI({mode: "clock", remove: function () {
+  // Alles opruimen zodat de klok met fast loading ontladen kan worden en er
+  // geen timers/listeners op de achtergrond blijven tekenen (batterij).
+  if (drawTimeout) clearTimeout(drawTimeout);
+  if (idleTimer) clearTimeout(idleTimer);
+  drawTimeout = undefined;
+  idleTimer = undefined;
+  Bangle.removeListener('step', onStep);
+  Bangle.removeListener('lcdPower', onLcdPower);
+  w.removeListener('update', onWeatherUpdate);
+}});
 Bangle.loadWidgets();
 Bangle.drawWidgets();
+updateWeatherDisplay();
 resetIdleTimer();
-draw();
+drawAll();
 
 })();
