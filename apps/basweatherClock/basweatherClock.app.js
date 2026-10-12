@@ -21,14 +21,18 @@
  *   4. Batterij-optimalisatie. Vier maatregelen:
  *      a. Bij stilstand: als het horloge 10 minuten niet bewogen is (gemeten
  *         via Bangle 'step'), schakelt het over naar een herteken-interval van
- *         5 minuten. Zodra het horloge weer beweegt, ontwaakt de klok direct en
- *         hervat het 1-minuut interval.
+ *         5 minuten. Zodra het horloge weer beweegt, of zodra het scherm weer
+ *         zichtbaar wordt (ontgrendelen/achtergrondverlichting aan), ontwaakt de
+ *         klok direct en hervat het 1-minuut interval.
  *      b. Deelupdates: normaal verandert alleen de tijd. In plaats van elke
- *         minuut het hele appRect te wissen en opnieuw te tekenen, wissen we
- *         alleen het vak van de tijd. Alleen bij middernacht (datum), een
- *         weerupdate of te weinig ruimte tekenen we alles opnieuw. Dat scheelt
- *         CPU-werk en, doordat de firmware alleen gewijzigde gebieden naar het
- *         (memory-)LCD schrijft, ook beeldschermvermogen.
+ *         minuut het hele appRect te wissen en opnieuw te tekenen, houden we
+ *         het uur-deel en de minuten op een vaste x (uur rechts, minuten
+ *         links). Daardoor kunnen we bij een gewone minuutwissel alleen het
+ *         minutenstuk wissen en tekenen; het uur-deel blijft staan. Bij een
+ *         uurwissel, middernacht (datum), een weerupdate of te weinig ruimte
+ *         tekenen we (delen) opnieuw. Dat scheelt CPU-werk en, doordat de
+ *         firmware alleen gewijzigde gebieden naar het (memory-)LCD schrijft,
+ *         ook beeldschermvermogen.
  *      c. Weer op verzoek lezen: w.get() leest weather.json van flash en parset
  *         JSON. Dat gebeurt nu bij het starten en daarna alleen nog als de
  *         weather-module een 'update' stuurt (niet meer elke minuut). De
@@ -339,12 +343,23 @@ function onStep() {
 }
 Bangle.on('step', onStep);
 
-// Op Bangle.js 1 stopt de timer als het scherm uit is (stroom besparen) en
-// hervat hij zodra het scherm weer aan gaat. Op Bangle.js 2 staat het scherm
-// altijd aan, dus dan gebeurt hier niets bijzonders.
+// Het scherm werd weer zichtbaar. Op Bangle.js 1 via 'lcdPower'; op Bangle.js 2
+// staat het LCD altijd aan en gaat de achtergrondverlichting aan bij het
+// ontgrendelen ('lock'). Was de klok inactief, dan kan de getoonde tijd
+// verouderd zijn: werk dan direct bij, hervat het 1-minuut schema en begin
+// opnieuw te tellen voor de inactiviteit.
+function onWake() {
+  if (isIdle) {
+    resetIdleTimer();
+  } else if (!drawTimeout) {
+    // Bangle.js 1: de timer stond stil doordat het scherm uit was
+    tick();
+  }
+}
+
 function onLcdPower(on) {
   if (on) {
-    tick(); // direct actueel + schema hervatten
+    onWake();
   } else if (drawTimeout) {
     clearTimeout(drawTimeout);
     drawTimeout = undefined;
@@ -352,18 +367,26 @@ function onLcdPower(on) {
 }
 Bangle.on('lcdPower', onLcdPower);
 
+function onLock(locked) {
+  if (!locked) onWake();
+}
+Bangle.on('lock', onLock);
+
 // ------------------------------------------------- tekenen / bijwerken
 var drawTimeout;
 var lastDateStr = null; // om middernacht te detecteren
-var lastTimeW = 0;      // breedte van de vorige tijd, i.v.m. wissen
+var lastTimeStr = null; // vorige tijd (om uurwissel te detecteren)
+var lastHourStr = null; // uur-deel; hieruit volgt de vaste minutenpositie
+var lastHourW = 0;      // breedte van het uur-deel
+var timeMinX = null;    // vaste x waar de minuten beginnen (binnen het uur)
+var lastClockLeft = null;  // linkerrand van de vorige tijdtekening
+var lastClockRight = null; // rechterrand van de vorige tijdtekening
 
-// Wis- en tekenvak voor alleen de tijd. Geeft null terug als het vak de
-// datumregel zou raken; dan valt de aanroeper terug op volledig hertekenen.
-function timeBox(R, tw) {
+// Verticale band van de tijd. Geeft null terug als het vak de datumregel zou
+// raken; dan valt de aanroeper terug op volledig hertekenen.
+function timeBand(R, cy) {
   g.setFont(fontTime);
   var fh = g.getFontHeight();
-  var cx = R.x + R.w * PUNTEN.tijdX;
-  var cy = R.y + R.h * PUNTEN.tijdY;
   var half = Math.ceil((fh + 4) / 2);
   var top = cy - half, bot = cy + half;
   if (s.date) {
@@ -371,26 +394,61 @@ function timeBox(R, tw) {
     if (bot > dateTop) bot = dateTop;
   }
   if (bot <= top) return null;
-  var w = Math.max(tw, lastTimeW) + 4;
-  return {
-    x1: Math.round(cx - w / 2), y1: Math.round(top),
-    x2: Math.round(cx + w / 2), y2: Math.round(bot)
-  };
+  return { y1: Math.round(top), y2: Math.round(bot) };
 }
 
 function drawTime() {
   var R = Bangle.appRect;
   var str = fmtTime(new Date());
+  var hourStr = str.slice(0, -2); // bv. "10:" of "9:"
+  var minStr = str.slice(-2);     // bv. "42"
+  var cx = R.x + R.w * PUNTEN.tijdX;
+  var cy = R.y + R.h * PUNTEN.tijdY;
   g.setFont(fontTime);
-  var tw = g.stringWidth(str);
-  var b = timeBox(R, tw);
-  if (!b) return false;
+  var band = timeBand(R, cy);
+  if (!band) return false;
+  var wHour = g.stringWidth(hourStr);
+  var wMin = g.stringWidth(minStr);
+
+  // Uur-deel rechts, minuten links daarvan. De minuten krijgen een vaste x
+  // (timeMinX), zodat ze los te wissen en te tekenen zijn zonder de rest te
+  // verschuiven. Bij een uurwissel herberekenen we de layout; dan volgt toch
+  // een volledige tijdtekening.
+  if (hourStr !== lastHourStr || timeMinX === null) {
+    lastHourStr = hourStr;
+    // Gehele pixelposities: tekenen en wissen vallen dan precies op dezelfde
+    // kolom. Anders kan er bij het wissen een 1-pixel-streepje van de vorige
+    // minuten blijven staan (rond de fractie naar boven af).
+    lastHourW = Math.round(wHour);
+    timeMinX = Math.round(cx - (wHour + wMin) / 2) + lastHourW;
+    lastTimeStr = null; // forceer volledige tijdtekening
+  }
+
+  var right = timeMinX + wMin;
   g.reset();
-  g.clearRect(b.x1, b.y1, b.x2, b.y2);
+  if (lastTimeStr) {
+    // alleen de minuten: wis het minutenvak en teken de minuten opnieuw
+    var pr = lastClockRight === null ? right : lastClockRight;
+    g.clearRect(timeMinX, band.y1,
+                Math.ceil(Math.max(pr, right)) + 1, band.y2);
+  } else {
+    // hele tijd: wis uur + minuten (oude en nieuwe plek) en teken beide
+    var left = timeMinX - lastHourW;
+    var ol = lastClockLeft === null ? left : lastClockLeft;
+    var or = lastClockRight === null ? right : lastClockRight;
+    g.clearRect(Math.floor(Math.min(ol, left)) - 1, band.y1,
+                Math.ceil(Math.max(or, right)) + 1, band.y2);
+    g.setFont(fontTime);
+    g.setFontAlign(-1, 0);
+    g.drawString(hourStr, left, cy);
+  }
   g.setFont(fontTime);
-  g.setFontAlign(0, 0);
-  g.drawString(str, R.x + R.w * PUNTEN.tijdX, R.y + R.h * PUNTEN.tijdY);
-  lastTimeW = tw;
+  g.setFontAlign(-1, 0);
+  g.drawString(minStr, timeMinX, cy);
+
+  lastClockLeft = timeMinX - lastHourW;
+  lastClockRight = right;
+  lastTimeStr = str;
   return true;
 }
 
@@ -401,7 +459,7 @@ function drawAll() {
   g.reset();
   g.clearRect(R.x, R.y, R.x + R.w - 1, R.y + R.h - 1);
 
-  lastTimeW = 0;
+  lastTimeStr = null; // volledige tijd geforceerd, want we hebben net gewist
   lastDateStr = s.date ? fmtDate(date) : null;
   drawTime();
 
@@ -486,6 +544,7 @@ Bangle.setUI({mode: "clock", remove: function () {
   idleTimer = undefined;
   Bangle.removeListener('step', onStep);
   Bangle.removeListener('lcdPower', onLcdPower);
+  Bangle.removeListener('lock', onLock);
   w.removeListener('update', onWeatherUpdate);
 }});
 Bangle.loadWidgets();
